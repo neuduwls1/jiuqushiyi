@@ -1,0 +1,27 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+
+# Local device validation captures and emulator backup metadata
+/device-*.jpeg
+/post-reboot*.jpeg
+/preinstall-reboot*.jpeg
+/symlink-*.jpeg
+/after-reinstall.jpeg
+/device-system-backup/
+
+# Local signing configuration and credentials
+/build-profile.json5
+/artifacts/
+
+# Optional local screenshots are kept out of the public repository.
+/docs/screenshots/

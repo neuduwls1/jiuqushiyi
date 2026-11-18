@@ -1,0 +1,185 @@
+import { authentication } from '@kit.AccountKit'
+import { BusinessError } from '@kit.BasicServicesKit'
+import { common } from '@kit.AbilityKit'
+import { util } from '@kit.ArkTS'
+
+/**
+ * 华为账号登录（Account Kit）
+ *
+ * 官方链路：HuaweiIDProvider.createLoginWithHuaweiIDRequest()
+ *   → AuthenticationController(context).executeRequest(request)
+ *   → LoginWithHuaweiIDResponse.data.{ openID, unionID, authorizationCode, idToken }
+ *
+ * 约定：
+ * - 客户端只负责拿到身份标识，不保存密码，也拿不到密码；
+ * - context 必须传（拉起登录/授权页时缺参报 401），只支持 UIAbilityContext / UIExtensionContext；
+ * - state 每次随机生成并回验，防跨站请求伪造。
+ */
+
+export interface HuaweiAccountSession {
+  loggedIn: boolean
+  openId: string
+  unionId: string
+  message: string
+}
+
+/** 本地保存的 openID 与当前系统华为账号的关系 */
+export enum BindingState {
+  UNKNOWN = 0,     // 查询失败或设备能力不支持，不做处理
+  MATCH = 1,       // 一致，可继续用本地绑定
+  MISMATCH = 2,    // 系统已换成另一个华为账号
+  LOGGED_OUT = 3   // 系统当前没有登录华为账号
+}
+
+/** 官方错误码，见 Account Kit ArkTS 错误码 */
+enum AccountErrorCode {
+  FINGERPRINT_CHECK = 1001500001,
+  DUPLICATE_REQUEST = 1001500002,
+  SCOPE_UNSUPPORTED = 1001500003,
+  NOT_LOGGED_IN = 1001502001,
+  NOT_AUTHORIZED = 1001502002,
+  PARAM_INVALID = 1001502003,
+  NETWORK = 1001502005,
+  INTERNAL = 1001502009,
+  USER_CANCELED = 1001502012,
+  SCOPE_NOT_REQUESTED = 1001502014,
+  SYSTEM_SERVICE = 12300001
+}
+
+export class HuaweiAccountService {
+  /**
+   * 当前设备是否具备华为账号服务能力。
+   * 该能力是华为设备上的系统服务；OpenHarmony 开发板（如 RK3568）上不存在，
+   * 此时调用任何 Account Kit 接口都会失败，界面应提前隐藏入口而不是让用户白点。
+   */
+  static isSupported(): boolean {
+    try {
+      return canIUse('SystemCapability.AuthenticationServices.HuaweiID.Auth')
+    } catch (e) {
+      return false
+    }
+  }
+
+  /** 用户主动点登录：未登录华为账号时拉起系统登录页 */
+  static async signIn(context: common.Context): Promise<HuaweiAccountSession> {
+    return HuaweiAccountService.request(context, true)
+  }
+
+  /** 静默登录：不弹任何界面，只适合启动时尝试恢复登录态 */
+  static async signInSilently(context: common.Context): Promise<HuaweiAccountSession> {
+    return HuaweiAccountService.request(context, false)
+  }
+
+  /** 校验本地保存的 openID 是否仍是当前系统的华为账号（换账号后应重新授权） */
+  static async checkBinding(context: common.Context, openId: string): Promise<BindingState> {
+    if (openId.length === 0 || openId === 'demo-account') {
+      return BindingState.UNKNOWN
+    }
+    try {
+      const request: authentication.StateRequest = {
+        idType: authentication.IdType.OPEN_ID,
+        idValue: openId
+      }
+      const result: authentication.StateResult =
+        await new authentication.HuaweiIDProvider().getHuaweiIDState(request)
+      if (result.state === authentication.State.AUTHORIZED) {
+        return BindingState.MATCH
+      }
+      if (result.state === authentication.State.UNAUTHORIZED) {
+        return BindingState.MISMATCH
+      }
+      return BindingState.LOGGED_OUT
+    } catch (error) {
+      // 老设备/老系统可能不支持该接口，退化为“未知”，不影响正常登录
+      const err = error as BusinessError
+      console.info('[Account] state check skipped: ' + (err ? err.code : 0).toString())
+      return BindingState.UNKNOWN
+    }
+  }
+
+  /** 统一发请求：forceLogin 决定是否弹出账号登录页 */
+  private static async request(context: common.Context, forceLogin: boolean): Promise<HuaweiAccountSession> {
+    try {
+      const provider: authentication.HuaweiIDProvider = new authentication.HuaweiIDProvider()
+      const request: authentication.LoginWithHuaweiIDRequest =
+        provider.createLoginWithHuaweiIDRequest()
+      request.forceLogin = forceLogin
+      request.state = util.generateRandomUUID()
+
+      const controller: authentication.AuthenticationController =
+        new authentication.AuthenticationController(context)
+      const response: authentication.LoginWithHuaweiIDResponse =
+        await controller.executeRequest(request) as authentication.LoginWithHuaweiIDResponse
+
+      // 回验 state：响应必须与本次请求一一对应，防止被替换或重放
+      if (response.state !== undefined && response.state !== request.state) {
+        return HuaweiAccountService.failed('授权校验未通过，请重新点击登录')
+      }
+
+      const data: authentication.LoginWithHuaweiIDCredential | undefined = response.data
+      if (data !== undefined && data.openID !== undefined && data.openID.length > 0) {
+        return {
+          loggedIn: true,
+          openId: data.openID,
+          unionId: data.unionID,
+          message: '华为账号已授权，数据记在这个账号下'
+        }
+      }
+      return HuaweiAccountService.failed('没有取到账号标识，请稍后重试')
+    } catch (error) {
+      const err = error as BusinessError
+      const code: number = err !== undefined && err !== null ? err.code : 0
+      if (code === AccountErrorCode.NOT_LOGGED_IN && !forceLogin) {
+        // 静默登录失败属于预期内，交给界面降级，不打扰用户
+        return HuaweiAccountService.failed('')
+      }
+      return HuaweiAccountService.failed(HuaweiAccountService.hintForCode(code))
+    }
+  }
+
+  private static failed(message: string): HuaweiAccountSession {
+    return { loggedIn: false, openId: '', unionId: '', message: message }
+  }
+
+  /** 把错误码翻译成用户看得懂、且能直接照着排查的提示 */
+  static hintForCode(code: number): string {
+    if (code === AccountErrorCode.FINGERPRINT_CHECK) {
+      return '签名证书校验未通过（1001500001）：装到设备上的包，其证书指纹必须已在 AGC 该项目下登记'
+    }
+    if (code === AccountErrorCode.NOT_LOGGED_IN) {
+      return '这台设备还没登录华为账号，请先在系统设置里登录'
+    }
+    if (code === AccountErrorCode.USER_CANCELED) {
+      return '已取消授权'
+    }
+    if (code === AccountErrorCode.NETWORK) {
+      return '网络异常，请检查网络后重试'
+    }
+    if (code === AccountErrorCode.DUPLICATE_REQUEST) {
+      return '上一次授权还在处理中，请稍候'
+    }
+    if (code === AccountErrorCode.SCOPE_NOT_REQUESTED) {
+      return '应用未申请对应的账号权限，请到 AGC 补充申请'
+    }
+    if (code === AccountErrorCode.SYSTEM_SERVICE) {
+      return '系统账号服务异常，请稍后重试'
+    }
+    if (code === AccountErrorCode.INTERNAL) {
+      return '账号服务内部错误，请稍后重试'
+    }
+    if (code === 401) {
+      return '授权参数不正确（401）：检查创建 Controller 时是否传入了页面的 context'
+    }
+    if (code > 0) {
+      return '授权未完成（错误码 ' + code.toString() + '）。常见原因：设备未登录华为账号、'
+        + '证书指纹未配置到 AGC、包名与 AGC 不一致、Client ID 与 APP ID 不同却未配 client_id'
+    }
+    return '授权未完成，请检查网络后重试；模拟器没有华为账号服务，请改用真机'
+  }
+
+  /** 界面上只展示账号标识的后 8 位，避免整串 openID 铺在屏幕上 */
+  static maskedAccount(openId: string): string {
+    if (openId.length <= 8) return openId
+    return '账号标识 · ' + openId.substring(openId.length - 8)
+  }
+}

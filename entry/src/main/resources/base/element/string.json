@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "黄河文化数字档案"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "浏览与收藏黄河文化数字档案"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "九曲拾忆"
+    }
+  ]
+}
